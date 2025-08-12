@@ -1,11 +1,6 @@
-import sys
-print("==== PYTHON VERSION ====")
-print(sys.version)
-print("========================")
-import subprocess
-from flask import Response
-
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, render_template, send_from_directory, abort
+from flask_cors import CORS
+from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -22,23 +17,26 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from pymongo import MongoClient
+from doctor_manager import DoctorManager
+from lead_manager import LeadManager
 import secrets
 import json
 import time
 import requests
 from requests.auth import HTTPDigestAuth
-from datetime import datetime
-from pydub import AudioSegment
-import uuid
-from flask_cors import CORS
 import glob
 from pathlib import Path
-import json
-import base64                                   # <-- ADDED
-from io import BytesIO                          # <-- ADDED
-# ==== ElevenLabs Integration – imports start ====
-from elevenlabs import ElevenLabs, VoiceSettings  # pip install elevenlabs
-# ==== ElevenLabs Integration – imports end   ====
+import uuid
+import logging
+import traceback
+from google.cloud import texttospeech
+from bson import ObjectId
+from bson.errors import InvalidId
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
@@ -51,19 +49,10 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_urlsafe(16))
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 DOCUMENTS_FOLDER = os.getenv("DOCUMENTS_FOLDER", "./data/")
+ASSETS_FOLDER = os.path.join("public", "assets")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-
-# ==== ElevenLabs Integration – env start ====
-
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-
-ELEVENLABS_VOICE_ID= os.getenv("ELEVENLABS_VOICE_ID", "ZUrEGyu8GFMwnHbvLhv2")  # default English voice
-
-# ==== ElevenLabs Integration – env end   ====
-
-# MongoDB Atlas Search Index configuration
 ATLAS_PUBLIC_KEY = os.getenv("ATLAS_PUBLIC_KEY")
 ATLAS_PRIVATE_KEY = os.getenv("ATLAS_PRIVATE_KEY")
 ATLAS_GROUP_ID = os.getenv("ATLAS_GROUP_ID")
@@ -76,7 +65,11 @@ client = MongoClient(MONGODB_URI)
 db = client.Gemini
 chat_collection = db.chat_history
 lead_collection = db.lead_data
+appointment_collection = db["appointment_data"]
 collection_name = "customer_data"
+
+doctor_manager = DoctorManager(MONGODB_URI, DATABASE_NAME)
+lead_manager = LeadManager(MONGODB_URI, DATABASE_NAME)
 
 # Configure Google AI
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -101,111 +94,176 @@ lead_extraction_llm = ChatGoogleGenerativeAI(
     google_api_key=GOOGLE_API_KEY
 )
 
-
-
-# ==== ElevenLabs Integration – client start ====
-
-eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
-# guard if key missing
-if not eleven_client:
-    print("[WARN] ELEVENLABS_API_KEY not set – voice endpoints will 503.")
-# ==== ElevenLabs Integration – client end   ====
-# ------------------------------------------------
-#  3 · PROMPTS & HELPERS
-
-
 # Prompt templates
 CONTEXT_SYSTEM_PROMPT = """Given a chat history and the latest user question \
 which might reference context in the chat history, formulate a standalone question \
 which can be understood without the chat history. Do NOT answer the question, \
 just reformulate it if needed and otherwise return it as is."""
 
-
 QA_SYSTEM_PROMPT = """
-Your name is Nisaa – the smart virtual assistant on this website. Follow these operating instructions:
- 
+You are Nisaa – the smart virtual assistant on this website. Follow these instructions precisely.
+
 I. 🎯 Purpose:
-You assist visitors with clear, helpful answers based **only** on the provided context. Your responses should be concise, either in the form of a short summary or in **2–3 natural lines**. You also guide users toward sharing their details and booking expert consultations.
- 
-⚠️ If asked something outside the provided context, say:
-"I can only provide details based on our official documents. For anything else, please contact our team directly."
- 
+- Answer user questions based **strictly on the provided context**
+- Keep responses concise: a short summary or **2–3 friendly, natural lines**
+- Guide users to book expert consultations (doctor appointments) OR general service meetings — keep these flows separate
+
 II. 🗣️ Tone & Style:
-- Warm, professional, emotionally intelligent
-- Keep all responses natural and human-like
-- Never sound robotic, overly technical, or salesy
-- Replies must be **no longer than 2–3 lines**, unless a brief summary is needed
- 
-III. 💬 First Message:
-On greeting, respond with:
-"Hi, this is Nisaa! It’s nice to meet you here. How can I assist you today?"
- 
-IV. 🔄 Lead Capture Flow:
-1. Begin by helping — **do not** ask for personal info in the first two replies.
-2. After your second helpful response (around the 3rd message), ask:
-   “By the way, may I know your name? It’s always nice to help you personally.”
-3. If the user doesn’t provide a name, gently follow up:
-   “Just before we move forward, may I please know your name? It helps me assist you better.”
-4. Once the name is shared, continue naturally and use it in responses.
-5. On the 5th–6th message, ask:
-   - “Would you like me to email this to you?”
-   - “Also, may I have your phone number in case our team needs to follow up?”
-6. Ask for their **service interest**, and offer to schedule an expert consultation.
-7. Keep it human — ask a **maximum of 2 questions per message**.
- 
-V. 💡 Hook Prompts (only after name is shared):
-- “Would you like help choosing the right service?”
-- “Want to see how others use this?”
-- “Shall I walk you through a real example?”
-- “Would you like to try a demo of this?”
-- “Interested in seeing how this helped other clients?”
- 
-VI. 📞 Booking an Expert Call:
-- Ask for topic/service of interest
-- Ask for their preferred date and time
-- Confirm schedule
-- Collect name (if not already)
-- Collect email and phone number
-- Confirm the booking and offer a reminder
- 
-VII. 🔁 Fallback Handling:
-- If repeated: “Let me explain that again, no worries.”
-- If inactive: “Still there? I’m right here if you need anything.”
-- If ending: “It’s been a pleasure! Come back anytime.”
- 
-VIII. 📝 Message Format:
-- Keep all replies short (2–3 lines) or give a brief summary when needed
-- Use bullet points for listing services
-- Do not include external links
-- Never use emojis unless explicitly requested
- 
+- Warm, professional, and emotionally intelligent
+- Always human-like, never robotic or overly technical
+- Never salesy or pushy
+- Avoid long messages unless summarizing is essential
+
+III. 💬 First Message (Greeting):
+"Hi, this is Nisaa! It's nice to meet you here. How can I assist you today?"
+
+IV. 🔄 Two Distinct Booking Flows:
+
+**A. General Service Meeting Flow:**
+If the user says:
+- "I want to book a meeting"
+- "Schedule a call"
+- "Talk to someone about services"
+- "Book a consultation" (without mentioning doctor/medical)
+
+→ This is a **general service meeting**:
+1. Ask for name in separate message
+2. Ask for email in separate message
+3. Ask for phone number in separate message
+4. Ask "Which service are you interested in?"
+5. Save to lead_data with type="service_meeting"
+
+**B. Doctor Consultation Flow:**
+If the user says:
+- "Book a doctor consultation"
+- "I want to meet Dr. [name]"
+- "Book an appointment with [specialization]"
+- "Medical consultation"
+
+→ This is a **doctor appointment**:
+1. Show list of available doctors with specialization
+2. After user selects doctor: Show time slots (10 AM - 6 PM, excluding 1-2 PM lunch)
+3. Mark slots as: ✅ Available / ❌ Busy
+4. If user selects available time:
+   - Ask for name (if not already collected)
+   - Ask for phone number
+5. Confirm: "Your appointment with Dr. [Name] on [Date] at [Time] is confirmed."
+6. Save to appointment_data with fields: doctor_name, specialization, appointment_date, appointment_time, user_name, contact_number, status=Booked, source=chatbot
+
+**C. Unclear Intent:**
+If unclear whether they mean service meeting or doctor appointment:
+→ Ask: "Just to confirm — do you mean a general meeting about our services, or a doctor consultation?"
+→ Continue only after user confirms.
+
+V. 🔄 Lead Capture Rules (General Flow):
+1. Never ask for personal details in the first two replies to a new topic
+2. If user asks about a service:
+   - Give clear, friendly explanation in 2–3 lines
+   - Do **not** ask for their name in the same message
+3. In the **next** message, ask separately: "By the way, may I know your name? It's always nice to help you personally."
+4. Always ask for user details (name, email, phone) in **separate messages only**, *after* the response is completed
+5. If user declines to share name, respond kindly:
+   - "No problem at all! I'm here to help with anything you need."
+   - "That's totally fine. Let me know how I can assist you further."
+   - "I understand! We can still continue — just tell me what you'd like to know."
+6. Once name is shared, use it naturally in future responses
+
+VI. 📧 Contact Info Collection (General Flow):
+7. Ask for email first: "Would you like me to email this information to you? What's the best email address for you?"
+8. If they decline, ask gently once more: "Are you sure you don't want me to email it? It can be helpful to keep a copy."
+9. If declined again, do not ask again (unless for booking)
+10. If email is shared, ask for phone number: "Also, may I have your phone number in case our team needs to follow up?"
+
+VII. 💡 CTA Hooks (use **only after name is shared** and **only for general flow**):
+- "Would you like help choosing the right service?"
+- "Want to see how others use this?"
+- "Shall I walk you through a real example?"
+- "Would you like to try a demo of this?"
+- "Interested in seeing how this helped other clients?"
+
+VIII. 🎥 360° View Handling:
+A. For general 360° requests:
+- Say: "Sure! A 360° virtual tour lets you explore our space as if you're really there — many clients love using it to build trust and increase engagement."
+- Then ask: "Would you like to check it out?"
+- If yes, reply: "Here's the 360° virtual tour. Tap a view below to explore:"
+  - Main Lobby: /virtualtour.html?scene=main-lobby
+  - Conference Room: /virtualtour.html?scene=conference-room
+  - Office: /virtualtour.html?scene=office
+  - Entry: /virtualtour.html?scene=entry
+  - Studio: /virtualtour.html?scene=studio
+
+B. For specific room requests:
+- Say: "Sure! Here's the 360° view of the {{room name}} — feel free to explore it:"
+- Then link that scene only.
+
+❗ Never ask for personal details in any 360° response  
+❗ Never include booking CTAs in 360° responses
+
+IX. 🔁 General Fallbacks:
+- Repeated question: "Let me explain that again, no worries."
+- Silence: "Still there? I'm right here if you need anything."
+- Goodbye: "It's been a pleasure! Come back anytime."
+- Unclear: "I didn't catch that — could you rephrase?"
+
+X. 🔄 Topic Continuity:
+- Do **not** move to lead capture, suggest other topics, or ask questions until the **current user request is answered clearly**
+- Transition only if the user is satisfied, changes topic, or becomes inactive
+- Always finish the current flow (general or doctor) before changing topics
+
+XI. 📝 Message Format:
+- Use natural 2–3 line responses unless summarizing
+- Use bullet points for services or lists
+- Ask for each personal detail (name, email, phone) in separate messages
+- No external links except 360° tour links
+- Do not use emojis (unless the user uses them first)
+
+XII. 🤝 Investor Inquiries:
+If someone mentions investing:
+- Say: "That's great to hear! We truly appreciate your interest in investing in Raising100x. For investment discussions, I recommend connecting with our senior team — would you like their contact info?"
+
+XIII. 💼 Services Questions (Dynamic):
+If the user asks:
+- "What services do you provide?"
+- "Tell me about your services"
+- "What do you offer?"
+
+→ Then fetch the service list from backend or MongoDB using `/get_services`.
+Say: "Sure! Here are some of our key services:"
+- [List of services fetched dynamically]
+Then add: "Let me know which service you'd like to explore more!"
+
+XIV. ⚠️ Important Rules:
+- **Never mix general service meetings with doctor appointments**
+- **Always confirm intent if unclear**
+- **Complete one flow before starting another**
+- **Keep doctor appointments strictly medical/consultation focused**
+- **Keep service meetings for business/general inquiries**
+
+---
+
 Context: {context}  
 Chat History: {chat_history}  
 Question: {input}  
- 
-Answer (based strictly on context, in short summary or 2–3 friendly lines. Only use CTA/hooks **after name is known**):
+
+Answer (strictly based on context, in short summary or 2–3 friendly lines. Distinguish between general service meetings and doctor consultations. Use CTA hooks only after name is known and only for general flow. Never ask personal info in 360° replies):
 """
- 
- 
 
-
-LEAD_EXTRACTION_PROMPT = """
-Extract the following information from the conversation if available:
+LEAD_EXTRACTION_PROMPT = """Extract the following information from the conversation if available:
 - name
-- email_id
+- email_id  
 - contact_number
 - location
 - service_interest
 - appointment_date
 - appointment_time
+- doctor_name
 
-Return ONLY a valid JSON object with these fields with NO additional text before or after.
+Return ONLY a valid JSON object with these fields with NO additional text before or after.  
 If information isn't found, leave the field empty.
 
 Do not include any explanatory text, notes, or code blocks. Return ONLY the raw JSON.
 
-Conversation: {conversation}
-"""
+Conversation: {conversation}"""
 
 # Create prompt templates
 contextualize_q_prompt = ChatPromptTemplate.from_messages([
@@ -228,120 +286,6 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
         chat_store[session_id] = ChatMessageHistory()
     return chat_store[session_id]
 
-# ==== ElevenLabs Integration – helper functions start ====
-# def tts_generate(text: str, voice_id: str = ELEVENLABS_VOICE_ID) -> bytes:
-#     """Generate MP3 bytes from text using ElevenLabs."""
-#     if not eleven_client:
-#         raise RuntimeError("ElevenLabs client not configured")
-#     try:
-#         stream = eleven_client.text_to_speech.convert(
-#             voice_id=voice_id,
-#             text=text,
-#             model_id="eleven_turbo_v2_5",
-#             output_format="mp3_22050_32",
-#             voice_settings=VoiceSettings()
-#         )
-#         audio_bytes = b"".join(stream)
-#         print("🎤 TTS generated length:", len(audio_bytes))
-#         return audio_bytes
-#     except Exception as e:
-#         import traceback
-#         print("🎤 TTS failed:", e)
-#         traceback.print_exc()
-#         raise
-
-
-def tts_generate(text: str, voice_id: str = ELEVENLABS_VOICE_ID) -> bytes:
-    """Enhanced TTS with debugging"""
-    print(f"🎵 TTS: Starting generation for {len(text)} characters")
-    
-    if not eleven_client:
-        raise RuntimeError("ElevenLabs client not configured")
-    
-    if not text or not text.strip():
-        raise ValueError("No text provided for TTS")
-    
-    # Limit text length
-    if len(text) > 3000:
-        text = text[:3000] + "..."
-        print(f"🎵 TTS: Text truncated to 3000 characters")
-    
-    try:
-        print(f"🎵 TTS: Calling ElevenLabs API with voice {voice_id}...")
-        
-        stream = eleven_client.text_to_speech.convert(
-            voice_id=voice_id,
-            text=text,
-            model_id="eleven_turbo_v2_5",
-            output_format="mp3_22050_32",
-            voice_settings=VoiceSettings(
-                stability=0.75,
-                similarity_boost=0.8,
-                style=0.0,
-                use_speaker_boost=True
-            )
-        )
-        
-        print("🎵 TTS: Collecting audio stream...")
-        audio_bytes = b"".join(stream)
-        
-        if not audio_bytes:
-            raise RuntimeError("TTS generated empty audio")
-        
-        print(f"🎵 TTS: Generated {len(audio_bytes)} bytes")
-        return audio_bytes
-        
-    except Exception as e:
-        print(f"🎵 TTS: Error occurred: {str(e)}")
-        raise
-
-# def stt_transcribe(audio_bytes: bytes, language_code: str | None = None) -> str:
-#     """Transcribe user speech with ElevenLabs Scribe v1 (99‑lang auto-detect)."""
-#     if not eleven_client:
-#         raise RuntimeError("ElevenLabs client not configured")
-#     print("✅ Starting STT transcription...")
-#     resp = eleven_client.speech_to_text.convert(
-#         file=BytesIO(audio_bytes),
-#         model_id="scribe_v1",
-#         language_code=language_code,
-#         diarize=False,       
-#     )
-#     return resp.text
-def stt_transcribe(audio_bytes: bytes, language_code: str | None = None) -> str:
-    """Enhanced STT with debugging"""
-    print(f"🗣️  STT: Starting transcription for {len(audio_bytes)} bytes")
-    
-    if not eleven_client:
-        raise RuntimeError("ElevenLabs client not configured")
-    
-    if not audio_bytes:
-        raise ValueError("No audio data provided")
-    
-    try:
-        print("🗣️  STT: Calling ElevenLabs API...")
-        audio_io = BytesIO(audio_bytes)
-        
-        resp = eleven_client.speech_to_text.convert(
-            file=audio_io,
-            model_id="scribe_v1",
-            language_code=language_code,
-            diarize=False,
-        )
-        
-        print(f"🗣️  STT: API response received")
-        
-        if not resp or not hasattr(resp, 'text'):
-            raise RuntimeError("Invalid response from STT service")
-        
-        transcript = resp.text.strip() if resp.text else ""
-        print(f"🗣️  STT: Final transcript: '{transcript}'")
-        
-        return transcript
-        
-    except Exception as e:
-        print(f"🗣️  STT: Error occurred: {str(e)}")
-        raise
-# ==== ElevenLabs Integration – helper functions end   ====
 # Atlas Search Index management functions
 def create_atlas_search_index():
     url = f"https://cloud.mongodb.com/api/atlas/v2/groups/{ATLAS_GROUP_ID}/clusters/{ATLAS_CLUSTER_NAME}/search/indexes"
@@ -391,28 +335,23 @@ def load_multiple_documents():
     """Load multiple PDF and text files from the documents folder"""
     documents = []
     
-    # Create documents folder if it doesn't exist
     os.makedirs(DOCUMENTS_FOLDER, exist_ok=True)
     
-    # Load PDF files
     pdf_files = glob.glob(os.path.join(DOCUMENTS_FOLDER, "*.pdf"))
     for pdf_file in pdf_files:
         print(f"Loading PDF: {pdf_file}")
         loader = PyPDFLoader(pdf_file)
         docs = loader.load()
-        # Add source metadata
         for doc in docs:
             doc.metadata['source_file'] = os.path.basename(pdf_file)
             doc.metadata['file_type'] = 'pdf'
         documents.extend(docs)
     
-    # Load text files
     txt_files = glob.glob(os.path.join(DOCUMENTS_FOLDER, "*.txt"))
     for txt_file in txt_files:
         print(f"Loading text file: {txt_file}")
         loader = TextLoader(txt_file, encoding='utf-8')
         docs = loader.load()
-        # Add source metadata
         for doc in docs:
             doc.metadata['source_file'] = os.path.basename(txt_file)
             doc.metadata['file_type'] = 'txt'
@@ -424,12 +363,9 @@ def load_multiple_documents():
     print(f"Loaded {len(documents)} documents from {len(pdf_files + txt_files)} files")
     return documents
 
-# Initialize vector store
 def initialize_vector_store():
-    # Load multiple documents
     docs = load_multiple_documents()
     
-    # Split documents
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000, 
         chunk_overlap=200,
@@ -439,13 +375,11 @@ def initialize_vector_store():
     
     print(f"Split into {len(final_documents)} chunks")
     
-    # Check and manage Atlas Search Index
     response = get_atlas_search_index()
     if response.status_code == 200:
         print("Deleting existing Atlas Search Index...")
         delete_response = delete_atlas_search_index()
         if delete_response.status_code == 204:
-            # Wait for index deletion to complete
             print("Waiting for index deletion to complete...")
             while get_atlas_search_index().status_code != 404:
                 time.sleep(5)
@@ -454,10 +388,8 @@ def initialize_vector_store():
     elif response.status_code != 404:
         raise Exception(f"Failed to check Atlas Search Index: {response.status_code}, Response: {response.text}")
     
-    # Clear existing collection
     db[collection_name].delete_many({})
     
-    # Store embeddings with Gemini embeddings
     vector_search = MongoDBAtlasVectorSearch.from_documents(
         documents=final_documents,
         embedding=embeddings,
@@ -465,40 +397,44 @@ def initialize_vector_store():
         index_name=INDEX_NAME,
     )
     
-    # Debug: Verify documents in collection
     doc_count = db[collection_name].count_documents({})
     print(f"Number of documents in {collection_name}: {doc_count}")
     if doc_count > 0:
         sample_doc = db[collection_name].find_one()
         print(f"Sample document structure (keys): {list(sample_doc.keys())}")
     
-    # Create new Atlas Search Index
     print("Creating new Atlas Search Index...")
     create_response = create_atlas_search_index()
     print(f"Atlas Search Index creation status: {create_response.status_code}")
     
-    # Wait for index to be ready
     print("Waiting for index to be ready...")
-    time.sleep(30)  # Give some time for index to be created
+    time.sleep(30)
     
     return vector_search
 
-# Extract lead information using Gemini API
+def extract_message_pairs(msg_entries):
+    flat = []
+    for entry in msg_entries:
+        if isinstance(entry, dict) and "role" in entry and "content" in entry:
+            flat.append(entry)
+        elif isinstance(entry, list):
+            for subentry in entry:
+                if isinstance(subentry, dict) and "role" in subentry and "content" in subentry:
+                    flat.append(subentry)
+    return flat
+
 def extract_lead_info(session_id):
-    # Get chat history
     chat_doc = chat_collection.find_one({"session_id": session_id})
     if not chat_doc or "messages" not in chat_doc:
         return
     
-    # Convert conversation to plain text
-    conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_doc["messages"]])
+    flat_messages = extract_message_pairs(chat_doc.get("messages", []))
+    conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in flat_messages])
     
     try:
-        # Use the Gemini LLM to extract lead info
         response = lead_extraction_llm.invoke(LEAD_EXTRACTION_PROMPT.format(conversation=conversation))
         response_text = response.content.strip()
         
-        # Extract JSON from potential markdown code blocks
         if "```json" in response_text or "```" in response_text:
             import re
             json_match = re.search(r"```(?:json)?\n(.*?)\n```", response_text, re.DOTALL)
@@ -512,7 +448,6 @@ def extract_lead_info(session_id):
             print(f"Failed to parse JSON from Gemini response: {response_text}")
             print(f"JSON error: {str(e)}")
             
-            # Alternative approach: Use regex to find JSON-like structure
             import re
             json_pattern = r'\{[^}]*"name"[^}]*"email_id"[^}]*"contact_number"[^}]*"location"[^}]*"service_interest"[^}]*\}'
             json_match = re.search(json_pattern, response_text, re.DOTALL)
@@ -522,7 +457,6 @@ def extract_lead_info(session_id):
                     lead_data = json.loads(json_match.group(0))
                     print(f"Extracted JSON using regex: {lead_data}")
                 except json.JSONDecodeError:
-                    # Fallback if all parsing fails
                     lead_data = {
                         "name": "",
                         "email_id": "",
@@ -534,7 +468,6 @@ def extract_lead_info(session_id):
                         "parsing_error": "Failed to parse response"
                     }
             else:
-                # Final fallback
                 lead_data = {
                     "name": "",
                     "email_id": "",
@@ -546,14 +479,10 @@ def extract_lead_info(session_id):
                     "raw_response": response_text[:500]
                 }
         
-        # Add session_id & timestamp
         lead_data["session_id"] = session_id
-        lead_data["updated_at"] = datetime.utcnow()
-        
-        # Add LLM metadata for tracking
+        lead_data["updated_at"] = datetime.now(timezone.utc)
         lead_data["extraction_model"] = "gemini_" + GEMINI_MODEL
         
-        # Save to MongoDB
         lead_collection.update_one(
             {"session_id": session_id},
             {"$set": lead_data},
@@ -561,6 +490,35 @@ def extract_lead_info(session_id):
         )
     except Exception as e:
         print(f"[Lead Extraction Error] {e}")
+
+# Translation function for 360° view responses
+def translate_360_response(text, language):
+    language_map = {
+        'en': 'en-US',
+        'te': 'te-IN',
+        'hi': 'hi-IN',
+        'ta': 'ta-IN',
+        'mr': 'mr-IN'
+    }
+    try:
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=language_map.get(language, 'en-US'),
+            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        return response.audio_content
+    except Exception as e:
+        logger.error(f"Translation/TTS error for {language}: {str(e)}")
+        return text
 
 # Initialize vector store
 try:
@@ -570,433 +528,595 @@ except Exception as e:
     print(f"Failed to initialize vector store: {e}")
     raise
 
-def handle_chat(session_id: str, user_input: str) -> str:
-    # Create RAG pipeline with enhanced retrieval
-    document_chain = create_stuff_documents_chain(llm, qa_prompt)
-    retriever = vector_search.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": 8, "score_threshold": 0.6}
-    )
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-    retrieval_chain = create_retrieval_chain(history_aware_retriever, document_chain)
+client = MongoClient("mongodb+srv://raising100x:vNb3t4WLQZKMN2OZ@cluster0.v5haryq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+db = client["Gemini"]
+lead_collection = db["lead_data"]
+appointment_collection = db["appointment_data"]
 
-    conversational_rag_chain = RunnableWithMessageHistory(
-        retrieval_chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer",
-    )
-
-    # Invoke RAG chain
-    response = conversational_rag_chain.invoke(
-        {"input": user_input},
-        config={"configurable": {"session_id": session_id}}
-    )
-    answer = response['answer']
-
-    # Store in MongoDB
-    chat_collection.update_one(
-        {"session_id": session_id},
-        {
-            "$push": {
-                "messages": {
-                    "$each": [
-                        {"role": "user", "content": user_input, "timestamp": datetime.utcnow()},
-                        {"role": "assistant", "content": answer, "timestamp": datetime.utcnow()}
-                    ]
-                }
-            },
-            "$setOnInsert": {"created_at": datetime.utcnow()},
-        },
-        upsert=True
-    )
-
-    # Trigger lead extraction if enough messages
-    message_count = len(chat_collection.find_one({"session_id": session_id}).get("messages", []))
-    if message_count >= 4:
-        extract_lead_info(session_id)
-
-    return answer
-# @app.before_first_request
-# def list_routes():
-#     print("Registered routes:")
-#     for rule in app.url_map.iter_rules():
-#         print(f"{rule.methods} {rule.rule}")
+def confirm_appointment(lead_id):
+    lead = lead_collection.find_one({"_id": lead_id})
+    
+    if lead:
+        appointment_doc = {
+            "message": f"Appointment confirmed for {lead.get('name', '')}",
+            "response": "Your appointment is booked successfully.",
+            "timestamp": datetime.utcnow(),
+            "source": "chat",
+            "lead_id": str(lead["_id"]),
+            "doctor_name": lead.get("doctor_name", ""),
+            "appointment_date": lead.get("appointment_date", ""),
+            "appointment_time": lead.get("appointment_time", "")
+        }
+        
+        appointment_collection.insert_one(appointment_doc)
+        return True
+    return False
 
 # Routes
 @app.route('/')
 def index():
     return render_template('index.html')
 
-
-@app.route("/check_ffmpeg")
-def check_ffmpeg():
-    try:
-        output = subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-        return Response(output, mimetype="text/plain")
-    except Exception as e:
-        return f"FFmpeg not found or failed to execute: {e}", 500
-
 @app.route('/generate_session', methods=['GET'])
 def generate_session():
     session_id = str(uuid.uuid4())
     return jsonify({"session_id": session_id})
 
+# Add this to handle appointment booking flow
+class BookingState:
+    """Class to manage booking state for each session"""
+    states = {}
+    
+    @classmethod
+    def set_state(cls, session_id, state, data=None):
+        cls.states[session_id] = {"state": state, "data": data or {}}
+    
+    @classmethod
+    def get_state(cls, session_id):
+        return cls.states.get(session_id, {"state": "none", "data": {}})
+    
+    @classmethod
+    def clear_state(cls, session_id):
+        if session_id in cls.states:
+            del cls.states[session_id]
+
 @app.route('/chat', methods=['POST'])
 def chat():
-    data = request.json
-    user_input = data.get('message')
-    session_id = data.get('session_id', str(uuid.uuid4()))
-    
-    if not user_input:
-        return jsonify({'error': 'No input provided'}), 400
-    
     try:
-        answer = handle_chat(session_id, user_input)
-        return jsonify({'response': answer}), 200
+        data = request.json
+        user_input = data.get('message', '').strip()
+        session_id = data.get('session_id', str(uuid.uuid4()))
+        language = data.get('language', 'en')
+
+        if not user_input:
+            return jsonify({'error': 'No input provided'}), 400
+
+        user_input_lower = user_input.lower()
+
+        # Log user message
+        chat_collection.update_one(
+            {"session_id": session_id},
+            {
+                "$push": {
+                    "messages": [{
+                        "role": "user",
+                        "content": user_input,
+                        "timestamp": datetime.now(timezone.utc)
+                    }]
+                },
+                "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
+            },
+            upsert=True
+        )
+
+        # Get current booking state
+        booking_state = BookingState.get_state(session_id)
+        current_state = booking_state["state"]
+        state_data = booking_state["data"]
+
+        # IMPROVED: Better intent detection for booking flows
+        doctor_keywords = ["doctor", "appointment", "medical", "consultation", "dr.", "physician", "specialist"]
+        general_meeting_keywords = ["meeting", "call", "service", "business", "consultation"]
+        
+        # Check if it's a doctor appointment request
+        is_doctor_request = any(keyword in user_input_lower for keyword in doctor_keywords)
+        is_general_meeting = any(keyword in user_input_lower for keyword in general_meeting_keywords) and not is_doctor_request
+
+        # DOCTOR APPOINTMENT FLOW
+        if current_state == "none" and is_doctor_request:
+            doctors = doctor_manager.get_all_doctors()
+            if not doctors:
+                response_text = "I'm sorry, no doctors are available at the moment. Please try again later."
+            else:
+                response_text = "I can help you book a doctor consultation! Here are our available doctors:\n\n"
+                for i, doctor in enumerate(doctors, 1):
+                    response_text += f"{i}. **Dr. {doctor['name']}** - {doctor['specialization']}\n"
+                    response_text += f"   Experience: {doctor.get('experience', 'N/A')}\n"
+                    response_text += f"   Fees: {doctor.get('fees', 'Contact for fees')}\n\n"
+                response_text += "Please reply with the doctor's name or number to continue."
+                
+                BookingState.set_state(session_id, "doctor_selection", {
+                    "doctors": doctors, 
+                    "booking_type": "doctor_appointment"
+                })
+
+            return log_and_respond(session_id, response_text, "doctor_list", {"doctors": doctors})
+
+        # GENERAL SERVICE MEETING FLOW
+        elif current_state == "none" and is_general_meeting:
+            response_text = "I'd be happy to help you schedule a service meeting! Let me gather some details to connect you with the right person.\n\nMay I know your name?"
+            
+            BookingState.set_state(session_id, "general_collect_name", {
+                "booking_type": "general_service_meeting"
+            })
+            
+            return log_and_respond(session_id, response_text, "general_meeting_start")
+
+        # GENERAL MEETING: Collect Name
+        elif current_state == "general_collect_name":
+            name = user_input.strip()
+            if len(name) < 2:
+                response_text = "Please provide your full name."
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Thank you, {name}! What's the best email address to reach you?"
+            
+            BookingState.set_state(session_id, "general_collect_email", {
+                **state_data,
+                "user_name": name
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        # GENERAL MEETING: Collect Email
+        elif current_state == "general_collect_email":
+            email = user_input.strip()
+            
+            # Basic email validation
+            import re
+            if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+                response_text = "Please provide a valid email address."
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Great! Now, what's your contact number?"
+            
+            BookingState.set_state(session_id, "general_collect_contact", {
+                **state_data,
+                "email": email
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        # GENERAL MEETING: Collect Contact
+        elif current_state == "general_collect_contact":
+            contact = user_input.strip()
+            
+            import re
+            if not re.match(r'^\d{10}$', contact):
+                response_text = "Please provide a valid 10-digit contact number."
+                return log_and_respond(session_id, response_text)
+
+            response_text = "Perfect! Which service are you interested in discussing?"
+            BookingState.set_state(session_id, "general_collect_service", {
+                **state_data,
+                "contact_number": contact
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        # GENERAL MEETING: Collect Service Interest and Complete
+        elif current_state == "general_collect_service":
+            service_interest = user_input.strip()
+            
+            try:
+                # Save to lead_data with type="service_meeting"
+                lead_data = {
+                    "session_id": session_id,
+                    "name": state_data["user_name"],
+                    "email_id": state_data["email"],
+                    "contact_number": state_data["contact_number"],
+                    "service_interest": service_interest,
+                    "type": "service_meeting",
+                    "status": "New Lead",
+                    "source": "chatbot",
+                    "created_at": datetime.now(timezone.utc)
+                }
+                
+                lead_collection.update_one(
+                    {"session_id": session_id},
+                    {"$set": lead_data},
+                    upsert=True
+                )
+
+                response_text = f"✅ **Meeting Request Submitted!**\n\n"
+                response_text += f"**Name:** {state_data['user_name']}\n"
+                response_text += f"**Email:** {state_data['email']}\n"
+                response_text += f"**Contact:** {state_data['contact_number']}\n"
+                response_text += f"**Service Interest:** {service_interest}\n\n"
+                response_text += "Thank you! Our team will contact you within 24 hours to schedule your service meeting."
+
+                BookingState.clear_state(session_id)
+
+                return log_and_respond(session_id, response_text, "general_meeting_confirmed", {
+                    "lead_data": lead_data
+                })
+
+            except Exception as e:
+                logger.error(f"General meeting booking error: {str(e)}")
+                response_text = "Sorry, there was an error processing your request. Please try again or contact us directly."
+                BookingState.clear_state(session_id)
+                return log_and_respond(session_id, response_text)
+
+        # DOCTOR APPOINTMENT FLOW (Enhanced)
+        elif current_state == "doctor_selection":
+            selected_doctor = None
+            doctors = state_data.get("doctors", [])
+            
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(doctors):
+                    selected_doctor = doctors[idx]
+            else:
+                for doctor in doctors:
+                    if doctor["name"].lower() in user_input_lower or user_input_lower in doctor["name"].lower():
+                        selected_doctor = doctor
+                        break
+
+            if not selected_doctor:
+                response_text = "Please select a valid doctor by name or number from the list above."
+                return log_and_respond(session_id, response_text)
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            slots = doctor_manager.get_doctor_slots(selected_doctor["name"], today)
+            
+            available_slots = [slot for slot in slots if slot["status"] == "available"]
+            
+            if not available_slots:
+                response_text = f"Sorry, Dr. {selected_doctor['name']} has no available slots today. Would you like to check another doctor or try tomorrow?"
+                BookingState.set_state(session_id, "doctor_selection", {"doctors": doctors})
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Great! You selected **Dr. {selected_doctor['name']}** ({selected_doctor['specialization']}).\n\n"
+            response_text += f"Available slots for today ({today}):\n\n"
+            
+            for i, slot in enumerate(available_slots, 1):
+                response_text += f"{i}. {slot['time']}\n"
+            
+            response_text += "\nPlease select a time slot by number or time."
+            
+            BookingState.set_state(session_id, "slot_selection", {
+                "doctor": selected_doctor,
+                "slots": available_slots,
+                "date": today,
+                "booking_type": "doctor_appointment"
+            })
+
+            return log_and_respond(session_id, response_text, "time_slots", {"slots": available_slots})
+
+        elif current_state == "slot_selection":
+            selected_slot = None
+            slots = state_data.get("slots", [])
+            
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(slots):
+                    selected_slot = slots[idx]
+            else:
+                for slot in slots:
+                    if slot["time"] in user_input or user_input in slot["time"]:
+                        selected_slot = slot
+                        break
+
+            if not selected_slot:
+                response_text = "Please select a valid time slot from the list above."
+                return log_and_respond(session_id, response_text)
+
+            doctor_name = state_data["doctor"]["name"]
+            current_slots = doctor_manager.get_doctor_slots(doctor_name, state_data["date"])
+            slot_still_available = any(s["time"] == selected_slot["time"] and s["status"] == "available" for s in current_slots)
+            
+            if not slot_still_available:
+                response_text = f"Sorry, the {selected_slot['time']} slot is no longer available. Please select another slot."
+                available_slots = [slot for slot in current_slots if slot["status"] == "available"]
+                BookingState.set_state(session_id, "slot_selection", {
+                    **state_data,
+                    "slots": available_slots
+                })
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Perfect! You've selected {selected_slot['time']} with Dr. {doctor_name}.\n\n"
+            response_text += "To confirm your appointment, I need your details:\n\n"
+            response_text += "What's your full name?"
+            
+            BookingState.set_state(session_id, "doctor_collect_name", {
+                **state_data,
+                "selected_slot": selected_slot
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        elif current_state == "doctor_collect_name":
+            name = user_input.strip()
+            if len(name) < 2:
+                response_text = "Please provide your full name."
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Thank you, {name}! What's your email address?"
+            
+            BookingState.set_state(session_id, "doctor_collect_email", {
+                **state_data,
+                "user_name": name
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        elif current_state == "doctor_collect_email":
+            email = user_input.strip()
+            
+            import re
+            if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+                response_text = "Please provide a valid email address."
+                return log_and_respond(session_id, response_text)
+
+            response_text = f"Great! Now, please provide your contact number."
+            
+            BookingState.set_state(session_id, "doctor_collect_contact", {
+                **state_data,
+                "email": email
+            })
+
+            return log_and_respond(session_id, response_text)
+
+        elif current_state == "doctor_collect_contact":
+            contact = user_input.strip()
+            
+            import re
+            if not re.match(r'^\d{10}$', contact):
+                response_text = "Please provide a valid 10-digit contact number."
+                return log_and_respond(session_id, response_text)
+
+            try:
+                doctor = state_data["doctor"]
+                selected_slot = state_data["selected_slot"]
+                date = state_data["date"]
+                user_name = state_data["user_name"]
+                email = state_data["email"]
+
+                # Book appointment using doctor manager
+                appointment = doctor_manager.book_appointment(
+                    user_name=user_name,
+                    contact=contact,
+                    doctor_name=doctor["name"],
+                    slot_time=selected_slot["time"],
+                    date=date
+                )
+
+                # Save to appointment_data
+                appointment_data = {
+                    "session_id": session_id,
+                    "user_name": user_name,
+                    "email_id": email,
+                    "contact_number": contact,
+                    "doctor_name": doctor["name"],
+                    "specialization": doctor["specialization"],
+                    "appointment_date": date,
+                    "appointment_time": selected_slot["time"],
+                    "status": "Booked",
+                    "source": "chatbot",
+                    "created_at": datetime.now(timezone.utc)
+                }
+
+                appointment_collection.update_one(
+                    {"session_id": session_id},
+                    {"$set": appointment_data},
+                    upsert=True
+                )
+
+                # Also save to lead_data for tracking
+                lead_data = {
+                    **appointment_data,
+                    "type": "doctor_appointment",
+                    "converted": True
+                }
+                
+                lead_collection.update_one(
+                    {"session_id": session_id},
+                    {"$set": lead_data},
+                    upsert=True
+                )
+
+                response_text = f"🎉 **Doctor Appointment Confirmed!**\n\n"
+                response_text += f"**Patient:** {user_name}\n"
+                response_text += f"**Email:** {email}\n"
+                response_text += f"**Doctor:** Dr. {doctor['name']} ({doctor['specialization']})\n"
+                response_text += f"**Date:** {date}\n"
+                response_text += f"**Time:** {selected_slot['time']}\n"
+                response_text += f"**Contact:** {contact}\n\n"
+                response_text += "You will receive a confirmation email and call shortly. Thank you for choosing our services!"
+
+                BookingState.clear_state(session_id)
+
+                return log_and_respond(session_id, response_text, "doctor_appointment_confirmed", {
+                    "appointment": appointment_data
+                })
+
+            except Exception as e:
+                logger.error(f"Doctor appointment booking error: {str(e)}")
+                response_text = f"Sorry, there was an error booking your appointment: {str(e)}\nPlease try again or contact us directly."
+                BookingState.clear_state(session_id)
+                return log_and_respond(session_id, response_text)
+
+        # Handle 360° view requests (Enhanced from first version)
+        scene_mappings = [
+            {"keywords": ["new office interior", "interior of new office"], "scene": "NEW-OFFICE-INSIDE", "image": "/GoToNewOfficeInterior.JPG", "description": "new office interior"},
+            {"keywords": ["complete place", "main entry", "entry"], "scene": "ENTRY", "image": "/backToMainEntry.jpg", "description": "main entry"},
+            {"keywords": ["office room"], "scene": "ROOM1", "image": "/office.jpg", "description": "office room"},
+            {"keywords": ["admin block", "administration block"], "scene": "ADMIN-BLOCK", "image": "/adminblock.jpg", "description": "admin block"},
+            {"keywords": ["meeting room", "conference room"], "scene": "MEETING-ROOM", "image": "/meeting.jpg", "description": "meeting room"},
+            {"keywords": ["workspace", "working area", "place where they work"], "scene": "WORKSPACE", "image": "/workspace.jpg", "description": "workspace"},
+            {"keywords": ["new office"], "scene": "NEW-OFFICE", "image": "/officeroom.jpg", "description": "new office"},
+            {"keywords": ["studio entrance", "outside studio"], "scene": "STUDIO-OUTSIDE", "image": "/office-6.jpg", "description": "studio entrance"},
+            {"keywords": ["studio", "recording studio"], "scene": "STUDIO", "image": "/office-16.jpg", "description": "studio"}
+        ]
+
+        if any(keyword in user_input_lower for keyword in ['360', 'view', 'tour', 'show']):
+            logger.info(f"360° view request detected. Input: {user_input_lower}")
+            matched_scene = None
+            for scene in sorted(scene_mappings, key=lambda x: max(len(k) for k in x["keywords"]), reverse=True):
+                for keyword in scene["keywords"]:
+                    if keyword in user_input_lower:
+                        matched_scene = scene
+                        logger.info(f"Matched keyword: {keyword}, Scene: {scene['scene']}")
+                        break
+                if matched_scene:
+                    break
+
+            if matched_scene:
+                base_response = f"Here's the 360° view of the {matched_scene['description']}!"
+                response_data = {
+                    "response": base_response,
+                    "type": "360_view",
+                    "url": f"http://localhost:3001/panorama?scene={matched_scene['scene']}",
+                    "label": f"Explore the {matched_scene['description']} in 360°",
+                    "image": matched_scene['image'],
+                    "target": "_self"
+                }
+            else:
+                logger.info("No specific scene matched. Using default ENTRY scene.")
+                base_response = "Here's the 360° view of our office!"
+                response_data = {
+                    "response": base_response,
+                    "type": "360_view",
+                    "url": f"http://localhost:3001/panorama?scene=ENTRY",
+                    "label": "Explore the office in 360°",
+                    "image": "/office-15.jpg",
+                    "target": "_self"
+                }
+
+            chat_collection.update_one(
+                {"session_id": session_id},
+                {"$push": {
+                    "messages": [{
+                        "role": "assistant",
+                        "content": response_data["response"],
+                        "timestamp": datetime.now(timezone.utc)
+                    }]
+                }},
+                upsert=True
+            )
+
+            return jsonify(response_data), 200
+
+        # Default RAG fallback for other queries
+        document_chain = create_stuff_documents_chain(llm, qa_prompt)
+        retriever = vector_search.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs={"k": 8, "score_threshold": 0.0}
+        )
+        history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+        retrieval_chain = create_retrieval_chain(history_aware_retriever, document_chain)
+
+        conversational_rag_chain = RunnableWithMessageHistory(
+            retrieval_chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer"
+        )
+
+        response = conversational_rag_chain.invoke(
+            {"input": user_input},
+            config={"configurable": {"session_id": session_id}}
+        )
+
+        answer = response.get("answer", "").strip()
+        if not answer:
+            raise ValueError("LLM returned empty response.")
+
+        # Auto lead extraction for non-booking conversations
+        chat_doc = chat_collection.find_one({"session_id": session_id}) or {}
+        if len(chat_doc.get("messages", [])) >= 4:
+            extract_lead_info(session_id)
+
+        return log_and_respond(session_id, answer, "standard")
+
     except Exception as e:
-        print(f"Chat error: {str(e)}")
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
-    
-#     # Create RAG pipeline with enhanced retrieval
-#     document_chain = create_stuff_documents_chain(llm, qa_prompt)
-    
-#     # Enhanced retriever with better similarity threshold
-#     retriever = vector_search.as_retriever(
-#         search_type="similarity_score_threshold",
-#         search_kwargs={
-#             "k": 8,  # Increased to get more relevant context
-#             "score_threshold": 0.6  # Adjusted for Gemini embeddings
-#         }
-#     )
-    
-#     history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-#     retrieval_chain = create_retrieval_chain(history_aware_retriever, document_chain)
-    
-#     conversational_rag_chain = RunnableWithMessageHistory(
-#         retrieval_chain,
-#         get_session_history,
-#         input_messages_key="input",
-#         history_messages_key="chat_history",
-#         output_messages_key="answer",
-#     )
-    
-#     try:
-#         # Get response from RAG
-#         response = conversational_rag_chain.invoke(
-#             {"input": user_input},
-#             config={"configurable": {"session_id": session_id}}
-#         )
-#         answer = response['answer']
-        
-#         # Log retrieved context for debugging
-#         context_docs = response.get('context', [])
-#         print(f"Retrieved {len(context_docs)} context documents for query: {user_input}")
-        
-#         # Store message in MongoDB
-#         chat_collection.update_one(
-#             {"session_id": session_id},
-#             {
-#                 "$push": {
-#                     "messages": {
-#                         "$each": [
-#                             {"role": "user", "content": user_input, "timestamp": datetime.utcnow()},
-#                             {"role": "assistant", "content": answer, "timestamp": datetime.utcnow()}
-#                         ]
-#                     }
-#                 },
-#                 "$setOnInsert": {"created_at": datetime.utcnow()},
-#             },
-#             upsert=True
-#         )
-        
-#         # Extract lead info after sufficient conversation
-#         message_count = len(chat_collection.find_one({"session_id": session_id}).get("messages", []))
-#         if message_count >= 4:  # Extract after 2 user messages
-#             extract_lead_info(session_id)
-        
-#         return jsonify({'response': answer}), 200
-#     except Exception as e:
-#         print(f"Chat error: {str(e)}")
-#         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
-    
-# # --------------- voice chat (NEW) ----------------
-
-# # ==== ElevenLabs Integration – route start ====
-
-# @app.route("/chat_voice", methods=["POST"])
-# def chat_voice():
-#     if not eleven_client:
-#         return jsonify({"error": "Voice service not configured"}), 503
-
-#     # 1️⃣  Validate upload
-#     if "audio" not in request.files:
-#         return jsonify({"error": "No audio file provided"}), 400
-#     # ✅ DEBUG LOGS GO HERE
-#     try:
-#         print("===== DEBUG: /chat_voice called =====")
-#         print("Request headers:", request.headers)
-#         print("Request form:", request.form)
-#         print("Request files:", request.files)
-#         raw_file = request.files["audio"]
-#         session_id = request.form.get("session_id", str(uuid.uuid4()))
-#         language   = request.form.get("language")  or None       # optional
-#         # transcript = stt_transcribe(audio_bytes, language)
-#         voice_id   = request.form.get("voice_id", ELEVENLABS_VOICE_ID)
-
-#         # 2️⃣  Convert WEBM → WAV (16-bit 48 kHz)
-#         webm_bytes = raw_file.read()
-#         audio_seg  = AudioSegment.from_file(BytesIO(webm_bytes), format="webm")
-#         wav_io     = BytesIO()
-#         audio_seg.export(wav_io, format="wav")
-#         wav_bytes  = wav_io.getvalue()
-#         print("✅ WEBM converted to WAV – size", len(wav_bytes))
-
-#         # 3️⃣  Speech-to-text
-#         user_input = stt_transcribe(wav_bytes, language)
-#         print("🗣️  Transcript:", user_input or "(empty)")
-
-#         if not user_input.strip():
-#             return jsonify({"error": "Could not detect speech"}), 400
-
-#         # 4️⃣  RAG chat
-#         answer = handle_chat(session_id, user_input)
-#         print("🤖 Assistant:", answer[:80], "…")
-
-#         # 5️⃣  Text-to-speech
-#         tts_bytes = tts_generate(answer, voice_id)
-#         audio_b64 = base64.b64encode(tts_bytes).decode()
-
-#         # 6️⃣  Return both text + voice
-#         return jsonify({
-#             "transcript": user_input,
-#             "response":   answer,
-#             "audio_b64":  audio_b64,
-#             "audio_url": f"data:audio/mp3;base64,{audio_b64}",  # ← ADD THIS LINE
-#             "session_id": session_id,
-#         }), 200
-
-#     except Exception as e:
-#         # print full traceback for easier debugging
-#         import traceback, sys
-#         traceback.print_exc(file=sys.stdout)
-#         return jsonify({"error": f"Voice pipeline failed: {e}"}), 500
-
-@app.route("/chat_voice", methods=["POST"])
-def chat_voice():
-    print("=" * 60)
-    print("🎤 VOICE CHAT DEBUG - Starting request processing")
-    print("=" * 60)
-    
-    try:
-        # Step 1: Check ElevenLabs configuration
-        print("Step 1: Checking ElevenLabs configuration...")
-        if not ELEVENLABS_API_KEY:
-            error_msg = "ELEVENLABS_API_KEY environment variable not set"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 503
-        
-        if not eleven_client:
-            error_msg = "ElevenLabs client not initialized"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 503
-        
-        print(f"✅ ElevenLabs API Key: {'*' * (len(ELEVENLABS_API_KEY)-8) + ELEVENLABS_API_KEY[-4:]}")
-        print(f"✅ ElevenLabs client initialized")
-        
-        # Step 2: Check request data
-        print("\nStep 2: Checking request data...")
-        print(f"Request method: {request.method}")
-        print(f"Request headers: {dict(request.headers)}")
-        print(f"Request form keys: {list(request.form.keys())}")
-        print(f"Request files keys: {list(request.files.keys())}")
-        
-        if "audio" not in request.files:
-            error_msg = "No audio file provided in request"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 400
-            
-        raw_file = request.files["audio"]
-        if raw_file.filename == '':
-            error_msg = "Empty audio filename"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        print(f"✅ Audio file received: {raw_file.filename}")
-        
-        # Step 3: Get form parameters
-        print("\nStep 3: Getting form parameters...")
-        session_id = request.form.get("session_id", str(uuid.uuid4()))
-        language = request.form.get("language")
-        voice_id = request.form.get("voice_id", ELEVENLABS_VOICE_ID)
-        
-        print(f"Session ID: {session_id}")
-        print(f"Language: {language}")
-        print(f"Voice ID: {voice_id}")
-        
-        # Step 4: Read and validate audio file
-        print("\nStep 4: Reading audio file...")
-        try:
-            webm_bytes = raw_file.read()
-            file_size = len(webm_bytes)
-            print(f"✅ Audio file size: {file_size} bytes")
-            
-            if file_size == 0:
-                error_msg = "Audio file is empty"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 400
-                
-            if file_size > 50 * 1024 * 1024:  # 50MB limit
-                error_msg = f"Audio file too large: {file_size} bytes"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 400
-                
-        except Exception as read_error:
-            error_msg = f"Failed to read audio file: {str(read_error)}"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        # Step 5: Check FFmpeg availability
-        print("\nStep 5: Checking FFmpeg...")
-        try:
-            ffmpeg_output = subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-            print("✅ FFmpeg is available")
-            print(f"FFmpeg version: {ffmpeg_output.decode()[:100]}...")
-        except subprocess.CalledProcessError as e:
-            error_msg = f"FFmpeg error: {str(e)}"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 500
-        except FileNotFoundError:
-            error_msg = "FFmpeg not found - please install FFmpeg"
-            print(f"❌ {error_msg}")
-            return jsonify({"error": error_msg}), 500
-        
-        # Step 6: Convert audio format
-        print("\nStep 6: Converting audio format...")
-        try:
-            print("Creating AudioSegment from WEBM data...")
-            audio_seg = AudioSegment.from_file(BytesIO(webm_bytes), format="webm")
-            print(f"✅ Original audio: {len(audio_seg)}ms, {audio_seg.frame_rate}Hz, {audio_seg.channels} channels")
-            
-            # Convert to standard format
-            print("Converting to standard format...")
-            audio_seg = audio_seg.set_frame_rate(16000).set_channels(1)
-            print(f"✅ Converted audio: {len(audio_seg)}ms, {audio_seg.frame_rate}Hz, {audio_seg.channels} channels")
-            
-            # Export to WAV
-            print("Exporting to WAV...")
-            wav_io = BytesIO()
-            audio_seg.export(wav_io, format="wav")
-            wav_bytes = wav_io.getvalue()
-            print(f"✅ WAV export complete: {len(wav_bytes)} bytes")
-            
-        except Exception as conversion_error:
-            error_msg = f"Audio conversion failed: {str(conversion_error)}"
-            print(f"❌ {error_msg}")
-            import traceback
-            print("Conversion error traceback:")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        # Step 7: Speech-to-text
-        print("\nStep 7: Speech-to-text processing...")
-        try:
-            print("Calling ElevenLabs STT...")
-            user_input = stt_transcribe(wav_bytes, language)
-            print(f"✅ STT completed: '{user_input}'")
-            
-            if not user_input or not user_input.strip():
-                error_msg = "No speech detected in audio"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 400
-                
-        except Exception as stt_error:
-            error_msg = f"Speech-to-text failed: {str(stt_error)}"
-            print(f"❌ {error_msg}")
-            import traceback
-            print("STT error traceback:")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        # Step 8: Chat processing
-        print("\nStep 8: Processing chat...")
-        try:
-            print(f"Calling handle_chat with: '{user_input[:50]}...'")
-            answer = handle_chat(session_id, user_input)
-            print(f"✅ Chat response: '{answer[:100]}...'")
-            
-            if not answer:
-                answer = "I apologize, but I couldn't generate a response."
-                
-        except Exception as chat_error:
-            error_msg = f"Chat processing failed: {str(chat_error)}"
-            print(f"❌ {error_msg}")
-            import traceback
-            print("Chat error traceback:")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        # Step 9: Text-to-speech
-        print("\nStep 9: Text-to-speech processing...")
-        try:
-            print(f"Generating TTS for: '{answer[:50]}...'")
-            tts_bytes = tts_generate(answer, voice_id)
-            print(f"✅ TTS generated: {len(tts_bytes)} bytes")
-            
-            if not tts_bytes:
-                error_msg = "TTS generated empty audio"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 500
-                
-            # Encode to base64
-            audio_b64 = base64.b64encode(tts_bytes).decode()
-            print(f"✅ Base64 encoding complete: {len(audio_b64)} characters")
-            
-        except Exception as tts_error:
-            error_msg = f"Text-to-speech failed: {str(tts_error)}"
-            print(f"❌ {error_msg}")
-            import traceback
-            print("TTS error traceback:")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        # Step 10: Return response
-        print("\nStep 10: Preparing response...")
-        response_data = {
-            "transcript": user_input,
-            "response": answer,
-            "audio_b64": audio_b64,
-            "audio_url": f"data:audio/mp3;base64,{audio_b64}",
-            "session_id": session_id,
-        }
-        
-        print("✅ Voice chat processing completed successfully!")
-        print("=" * 60)
-        
-        return jsonify(response_data), 200
-        
-    except Exception as e:
-        error_msg = f"Unexpected error in voice chat: {str(e)}"
-        print(f"❌ CRITICAL ERROR: {error_msg}")
-        
-        import traceback
-        print("Full error traceback:")
+        logger.error("Chat error: %s", str(e))
         traceback.print_exc()
-        print("=" * 60)
-        
-        return jsonify({"error": error_msg}), 500  
+        return jsonify({
+            "response": "Sorry, an error occurred processing your request.",
+            "type": "error"
+        }), 200
+
+# Helper function to log and respond
+def log_and_respond(session_id, response_text, response_type="standard", extra_data=None):
+    """Helper function to log assistant message and return response"""
+    chat_collection.update_one(
+        {"session_id": session_id},
+        {"$push": {
+            "messages": [{
+                "role": "assistant",
+                "content": response_text,
+                "timestamp": datetime.now(timezone.utc)
+            }]
+        }},
+        upsert=True
+    )
+
+    response_data = {
+        "response": response_text,
+        "type": response_type
+    }
     
+    if extra_data:
+        response_data.update(extra_data)
+
+    return jsonify(response_data), 200
+
 
 @app.route('/leads', methods=['GET'])
 def get_leads():
-    # Simple admin route to get all leads (should be protected in production)
     leads = list(lead_collection.find({}, {"_id": 0}))
     return jsonify(leads)
 
+@app.route("/doctors", methods=["GET"])
+def get_doctors():
+    specialization = request.args.get("specialization")
+    if specialization:
+        doctors = doctor_manager.get_doctor_by_specialization(specialization)
+    else:
+        doctors = doctor_manager.get_all_doctors()
+    return jsonify(doctors)
+
+@app.route("/doctor-slots", methods=["GET"])
+def get_doctor_slots():
+    doctor_name = request.args.get("name")
+    if not doctor_name:
+        return jsonify({"error": "Doctor name required"}), 400
+    slots = doctor_manager.get_doctor_slots(doctor_name)
+    return jsonify({"name": doctor_name, "slots": slots})
+
+@app.route("/book", methods=["POST"])
+def book_consultation():
+    data = request.json
+    required_fields = ["user_name", "contact", "doctor", "time"]
+    
+    if not all(field in data for field in required_fields):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    doctor_name = data["doctor"]
+    slot_time = data["time"]
+    slots = doctor_manager.get_doctor_slots(doctor_name)
+
+    match = next((slot for slot in slots if slot["time"] == slot_time and slot["status"] == "available"), None)
+    if not match:
+        return jsonify({"error": "Slot not available"}), 400
+
+    doctor_manager.book_appointment(data["user_name"], data["contact"], doctor_name, slot_time)
+    return jsonify({"message": f"Appointment confirmed with {doctor_name} at {slot_time}."})
+
 @app.route('/upload_documents', methods=['POST'])
 def upload_documents():
-    """Route to handle document uploads and reinitialize vector store"""
     try:
         if 'files' not in request.files:
             return jsonify({'error': 'No files uploaded'}), 400
@@ -1008,84 +1128,97 @@ def upload_documents():
             if file.filename == '':
                 continue
             
-            # Check file type
             if not (file.filename.lower().endswith('.pdf') or file.filename.lower().endswith('.txt')):
                 continue
             
-            # Save file
             filename = file.filename
             file_path = os.path.join(DOCUMENTS_FOLDER, filename)
             file.save(file_path)
             uploaded_files.append(filename)
         
         if uploaded_files:
-            # Reinitialize vector store with new documents
             global vector_search
             vector_search = initialize_vector_store()
-            
             return jsonify({
                 'message': f'Successfully uploaded and processed {len(uploaded_files)} files',
                 'files': uploaded_files
             }), 200
         else:
             return jsonify({'error': 'No valid PDF or text files uploaded'}), 400
-            
     except Exception as e:
         return jsonify({'error': f'Upload failed: {str(e)}'}), 500
     
-# Add this diagnostic route
-@app.route('/voice_test', methods=['GET'])
-def voice_test():
-    """Test voice functionality step by step"""
-    results = {}
-    
-    # Test 1: Environment variables
-    results['env_vars'] = {
-        'ELEVENLABS_API_KEY': bool(ELEVENLABS_API_KEY),
-        'ELEVENLABS_VOICE_ID': ELEVENLABS_VOICE_ID
-    }
-    
-    # Test 2: ElevenLabs client
-    results['client'] = bool(eleven_client)
-    
-    # Test 3: FFmpeg
+@app.route('/appointments', methods=['GET'])
+def get_appointments():
+    appointments = list(appointment_collection.find({}, {"_id": 0}))
+    return jsonify(appointments)
+
+@app.route('/leads/<lead_id>', methods=['DELETE'])
+def delete_lead(lead_id):
     try:
-        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-        results['ffmpeg'] = True
-    except:
-        results['ffmpeg'] = False
-    
-    # Test 4: ElevenLabs API connectivity
-    if eleven_client:
-        try:
-            voices = eleven_client.voices.get_all()
-            results['api_connection'] = True
-            results['available_voices'] = len(voices.voices) if voices else 0
-        except Exception as e:
-            results['api_connection'] = False
-            results['api_error'] = str(e)
-    else:
-        results['api_connection'] = False
-    
-    # Test 5: MongoDB connection
+        # Check if lead_id is undefined or not a string
+        if not lead_id or not isinstance(lead_id, str):
+            return jsonify({"error": "Invalid lead ID format"}), 400
+        
+        if not ObjectId.is_valid(lead_id):
+            return jsonify({"error": "Invalid lead ID format"}), 400
+        
+        result = lead_collection.delete_one({"_id": ObjectId(lead_id)})
+        if result.deleted_count == 1:
+            logger.info(f"Lead {lead_id} deleted successfully")
+            return jsonify({"message": "Lead deleted successfully"}), 200
+        return jsonify({"error": "Lead not found"}), 404
+    except InvalidId:
+        return jsonify({"error": "Invalid lead ID format"}), 400
+    except Exception as e:
+        logger.error(f"Error deleting lead {lead_id}: {str(e)}")
+        return jsonify({"error": "An internal error occurred"}), 500
+
+@app.route('/appointments/<appointment_id>', methods=['DELETE'])
+def delete_appointment(appointment_id):
     try:
-        client.admin.command('ping')
-        results['mongodb'] = True
-    except:
-        results['mongodb'] = False
-    
-    return jsonify(results)
+        result = appointment_collection.delete_one({"_id": ObjectId(appointment_id)})
+        if result.deleted_count == 1:
+            return jsonify({"message": "Appointment deleted successfully"}), 200
+        return jsonify({"error": "Appointment not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/leads/<lead_id>', methods=['PUT'])
+def edit_lead(lead_id):
+    try:
+        data = request.json
+        result = lead_collection.update_one(
+            {"_id": ObjectId(lead_id)},
+            {"$set": data}
+        )
+        if result.matched_count == 1:
+            updated_lead = lead_collection.find_one({"_id": ObjectId(lead_id)}, {"_id": 0})
+            return jsonify({"message": "Lead updated successfully", "data": updated_lead}), 200
+        return jsonify({"error": "Lead not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/appointments/<appointment_id>', methods=['PUT'])
+def edit_appointment(appointment_id):
+    try:
+        data = request.json
+        result = appointment_collection.update_one(
+            {"_id": ObjectId(appointment_id)},
+            {"$set": data}
+        )
+        if result.matched_count == 1:
+            updated_appointment = appointment_collection.find_one({"_id": ObjectId(appointment_id)}, {"_id": 0})
+            return jsonify({"message": "Appointment updated successfully", "data": updated_appointment}), 200
+        return jsonify({"error": "Appointment not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     try:
-        # Check database connection
         client.admin.command('ping')
-        
-        # Check vector store
         doc_count = db[collection_name].count_documents({})
-        
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
@@ -1098,6 +1231,14 @@ def health_check():
             'error': str(e)
         }), 500
 
+@app.route('/<path:filename>')
+def serve_static(filename):
+    try:
+        return send_from_directory('public', filename, as_attachment=False)
+    except FileNotFoundError:
+        logger.error(f"File not found: {filename}")
+        abort(404)
+        
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
-    
+    app.run(debug=True, use_reloader=False)

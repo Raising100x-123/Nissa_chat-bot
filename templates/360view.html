@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>360° Virtual Tour</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css" />
+  <script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background-color: #000;
+      font-family: Arial, sans-serif;
+    }
+    #panorama {
+      width: 100%;
+      height: 100%;
+    }
+    #scene-title {
+      position: absolute;
+      top: 10px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: white;
+      font-size: 1.5em;
+      font-weight: bold;
+      text-shadow: 0 0 5px #000;
+      z-index: 10;
+    }
+    #scene-buttons {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      z-index: 10;
+    }
+    #scene-buttons button {
+      margin: 5px;
+      padding: 10px 18px;
+      font-size: 1em;
+      background-color: #ffffffcc;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    #scene-buttons button:hover {
+      background-color: #fff;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="scene-title">Loading scenes...</div>
+  <div id="panorama" role="application" aria-label="360 degree panorama viewer"></div>
+  <div id="scene-buttons"></div>
+
+  <script>
+    let viewer;
+    let scenes = {};
+
+    function initializeViewer(config) {
+      viewer = pannellum.viewer('panorama', config);
+      switchScene(config.default.firstScene);
+      renderSceneButtons();
+    }
+
+    function switchScene(sceneId) {
+      viewer.loadScene(sceneId);
+      document.getElementById('scene-title').innerText = scenes[sceneId].title || sceneId;
+    }
+
+    function renderSceneButtons() {
+      const buttonsDiv = document.getElementById('scene-buttons');
+      buttonsDiv.innerHTML = '';
+      Object.keys(scenes).forEach(sceneId => {
+        const btn = document.createElement('button');
+        btn.innerText = scenes[sceneId].title || sceneId;
+        btn.onclick = () => switchScene(sceneId);
+        buttonsDiv.appendChild(btn);
+      });
+    }
+
+    fetch('/api/360-scenes')
+      .then(response => response.json())
+      .then(data => {
+        if (!data || Object.keys(data).length === 0) {
+          document.getElementById('scene-title').innerText = 'No scenes found.';
+          return;
+        }
+
+        scenes = data;
+        const config = {
+          default: {
+            firstScene: Object.keys(scenes)[0],
+            autoLoad: true,
+            autoRotate: -2,
+            compass: true,
+            showControls: true
+          },
+          scenes: scenes
+        };
+
+        initializeViewer(config);
+      })
+      .catch(err => {
+        console.error('Error loading 360 scenes:', err);
+        document.getElementById('scene-title').innerText = 'Failed to load scenes.';
+      });
+  </script>
+</body>
+</html>

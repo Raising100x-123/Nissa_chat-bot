@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>mTouchLabs - AI Assistant</title>
+    <title>Raising100x - AI Assistant</title>
     <style>
         * {
             margin: 0;
@@ -434,9 +434,9 @@
     </style>
 </head>
 <body>
-    <div class="chat-container" role="main" aria-label="mTouchLabs AI Assistant Chat Interface">
+    <div class="chat-container" role="main" aria-label="Raising100x AI Assistant Chat Interface">
         <div class="chat-header">
-            <h1>mTouchLabs AI Assistant</h1>
+            <h1>Raising100x AI Assistant</h1>
             <p>Powered by Gemini AI - Nisaa</p>
         </div>
 
@@ -455,7 +455,7 @@
 
         <div class="chat-messages" id="chatMessages" role="log" aria-live="polite">
             <div class="welcome-message" role="region" aria-label="Welcome Message">
-                <h2>Welcome to mTouchLabs!</h2>
+                <h2>Welcome to Raising100x!</h2>
                 <p>I'm <em>Nisaa</em>, your AI assistant. I'm here to help with technology solutions and digital transformation.</p>
                 <p>Please upload documents for contextual assistance, or ask general questions like "show 360 view".</p>
             </div>
@@ -473,7 +473,7 @@
         </div>
     </div>
 
-    <script>
+<script>
 const chatInput = document.getElementById('chatInput');
 const sendButton = document.getElementById('sendButton');
 const fileInput = document.getElementById('fileInput');
@@ -493,12 +493,10 @@ async function initializeAssistant() {
         if (!sessionResponse.ok) throw new Error(`Session failed: ${sessionResponse.status}`);
         const sessionData = await sessionResponse.json();
         sessionId = sessionData.session_id;
-        console.log("Session ID:", sessionId);
 
         const healthResponse = await fetch('/health', { method: 'GET' });
         if (!healthResponse.ok) throw new Error(`Health check failed: ${healthResponse.status}`);
         const healthData = await healthResponse.json();
-        console.log("Health check:", healthData);
 
         if (healthData.status === 'healthy') {
             isChatReady = true;
@@ -520,7 +518,7 @@ async function initializeAssistant() {
 function enableChat() {
     chatInput.disabled = false;
     sendButton.disabled = false;
-    chatInput.placeholder = "Ask about mTouchLabs services...";
+    chatInput.placeholder = "Ask about Raising100x services...";
     chatInput.focus();
 }
 
@@ -601,7 +599,7 @@ function getDriveFileId(url) {
 function createMessageElement(isUser = false, content = null, imageData = null, viewData = null) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${isUser ? 'user' : 'assistant'}`;
-    
+
     const avatarDiv = document.createElement('div');
     avatarDiv.className = 'message-avatar';
     avatarDiv.textContent = isUser ? 'You' : 'Nisaa';
@@ -611,16 +609,12 @@ function createMessageElement(isUser = false, content = null, imageData = null, 
     contentDiv.className = 'message-content';
     contentDiv.setAttribute('role', 'log');
 
-    // Handle imageData (image preview)
     if (imageData && (imageData.text || imageData.image)) {
-        // Add text if provided
         if (imageData.text) {
             const textParagraph = document.createElement('p');
             textParagraph.textContent = imageData.text;
             contentDiv.appendChild(textParagraph);
         }
-
-        // Add image if provided
         if (imageData.image && imageData.link) {
             const link = document.createElement('a');
             link.href = imageData.link;
@@ -643,40 +637,55 @@ function createMessageElement(isUser = false, content = null, imageData = null, 
             link.appendChild(img);
             contentDiv.appendChild(link);
         }
-
-    } 
-    // Handle viewData (array of views/buttons)
-    else if (viewData && viewData.text && Array.isArray(viewData.views)) {
+    } else if (viewData && viewData.text && Array.isArray(viewData.views)) {
         const textParagraph = document.createElement('p');
         textParagraph.textContent = viewData.text;
         contentDiv.appendChild(textParagraph);
 
-        viewData.views.forEach(view => {
-            if (view.url && view.label) {
-                const link = document.createElement('a');
-                link.href = view.url;
-                link.target = '_blank';
-                link.rel = 'noopener noreferrer';
-                link.textContent = view.label;
-                link.style.display = 'inline-block';
-                link.style.marginTop = '8px';
-                link.style.padding = '6px 12px';
-                link.style.background = '#667eea';
-                link.style.color = 'white';
-                link.style.borderRadius = '6px';
-                link.style.textDecoration = 'none';
-                link.style.fontSize = '14px';
-                link.style.marginRight = '8px';
-                link.style.transition = 'background 0.3s';
-                link.addEventListener('mouseover', () => link.style.background = '#5a6fd8');
-                link.addEventListener('mouseout', () => link.style.background = '#667eea');
+        const cardContainer = document.createElement('div');
+        cardContainer.style.display = 'flex';
+        cardContainer.style.flexDirection = 'column';
+        cardContainer.style.gap = '10px';
+        cardContainer.style.marginTop = '10px';
 
-                contentDiv.appendChild(link);
+        viewData.views.forEach(view => {
+            if (view.url && view.label && view.image) {
+                const card = document.createElement('div');
+                card.style.display = 'flex';
+                card.style.flexDirection = 'column';
+                card.style.border = '1px solid #eee';
+                card.style.borderRadius = '10px';
+                card.style.overflow = 'hidden';
+                card.style.cursor = 'pointer';
+                card.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
+                card.style.transition = 'transform 0.2s ease-in-out';
+
+                const img = document.createElement('img');
+                img.src = view.image;
+                img.alt = view.label;
+                img.style.width = '100%';
+                img.style.display = 'block';
+
+                const caption = document.createElement('div');
+                caption.textContent = view.label;
+                caption.style.padding = '8px 12px';
+                caption.style.fontSize = '14px';
+                caption.style.backgroundColor = '#f8f8f8';
+                caption.style.fontWeight = 'bold';
+
+                card.addEventListener('click', () => {
+                    window.open(view.url, '_blank');
+                });
+
+                card.appendChild(img);
+                card.appendChild(caption);
+                cardContainer.appendChild(card);
             }
         });
-    } 
-    // Handle plain text content
-    else if (content) {
+
+        contentDiv.appendChild(cardContainer);
+
+    } else if (content) {
         const urlRegex = /(https?:\/\/[^\s]+)/g;
         const paragraphs = content.split('\n').filter(p => p.trim());
 
@@ -730,15 +739,7 @@ function createMessageElement(isUser = false, content = null, imageData = null, 
 
             contentDiv.appendChild(p);
         });
-
-        if (!contentDiv.childNodes.length) {
-            const p = document.createElement('p');
-            p.textContent = content || '...';
-            contentDiv.appendChild(p);
-        }
-    } 
-    // Fallback if no data
-    else {
+    } else {
         const p = document.createElement('p');
         p.textContent = '...';
         contentDiv.appendChild(p);
@@ -754,11 +755,8 @@ function addMessageToChat(element) {
     if (welcomeMessage) welcomeMessage.remove();
 
     chatMessagesContainer.appendChild(element);
-
-    // Always scroll after adding the message
     chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
 
-    // Also scroll again if an image in the last message loads later
     setTimeout(() => {
         const lastImage = chatMessagesContainer.querySelector('.message:last-child img');
         if (lastImage) {
@@ -768,7 +766,6 @@ function addMessageToChat(element) {
         }
     }, 100);
 }
-
 
 function showTypingIndicator() {
     if (typingIndicatorMessageElement) return;
@@ -828,9 +825,7 @@ async function sendMessage() {
         if (response.ok) {
             if (data.type === 'image_link' && data.image) {
                 addMessageToChat(createMessageElement(false, null, data));
-            } 
-            else if (data.type === '360_view') {
-                // If an image URL is provided, show it with link
+            } else if (data.type === '360_view') {
                 if (data.image && data.url) {
                     addMessageToChat(
                         createMessageElement(false, null, {
@@ -840,34 +835,24 @@ async function sendMessage() {
                             alt: (data.label || "360° View") + " preview"
                         })
                     );
-                }
-                // Else if views array is present
-                else if (Array.isArray(data.views)) {
+                } else if (Array.isArray(data.views)) {
                     addMessageToChat(createMessageElement(false, null, null, data));
-                }
-                // Fallback to plain text
-                else if (typeof data.response === 'string') {
+                } else if (typeof data.response === 'string') {
                     addMessageToChat(createMessageElement(false, data.response));
-                }
-                else {
+                } else {
                     addMessageToChat(createMessageElement(false, "No 360° view data received."));
                 }
-            }
-            else if (typeof data.response === 'string') {
+            } else if (typeof data.response === 'string') {
                 addMessageToChat(createMessageElement(false, data.response));
-            }
-            else {
+            } else {
                 addMessageToChat(createMessageElement(false, "Unexpected response received."));
-                console.warn("Unexpected response:", data);
             }
         } else {
             const errorMessage = data.error || `Server error: ${response.status}`;
             addMessageToChat(createMessageElement(false, `Error: ${errorMessage}`));
-            console.error("Chat API error:", response.status, data);
         }
     } catch (error) {
         hideTypingIndicator();
-        console.error('Chat error:', error);
         addMessageToChat(createMessageElement(false, `Communication error: ${error.message}`));
     } finally {
         if (isChatReady) enableChat();

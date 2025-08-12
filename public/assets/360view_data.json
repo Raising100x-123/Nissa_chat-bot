@@ -1,0 +1,24 @@
+{
+  "views": [
+    {
+      "id": "view1",
+      "title": "Main Lobby",
+      "url": "https://drive.google.com/file/d/1lPTpJosCCMjDk2s_NJL-rgSJ96UIlG-y/view?usp=sharing"
+    },
+    {
+      "id": "view2",
+      "title": "Conference Room",
+      "url": "https://drive.google.com/file/d/15xkg2IAubIGVjTXTtIZa1p2wxn_FdoU7/view?usp=sharing"
+    },
+    {
+      "id": "view3",
+      "title": "Reception Area",
+      "url": "https://drive.google.com/file/d/14U5SLUJMxiOqZ4ZmEiat9iXhFXJbF7C2/view?usp=sharing"
+    },
+    {
+      "id": "view4",
+      "title": "Executive Cabin",
+      "url": "https://drive.google.com/file/d/1Y5kaY9t5x28VQLNZ7iVR7Ge67ZLSXnJS/view?usp=sharing"
+    }
+  ]
+}
